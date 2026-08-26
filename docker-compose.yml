@@ -1,0 +1,184 @@
+name: banking-cdc-risk-monitoring
+
+services:
+  source-postgres:
+    image: postgres:17-alpine
+    container_name: banking-source-postgres
+    environment:
+      POSTGRES_DB: core_banking
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    ports:
+      - "100.120.10.52:5435:5432"
+    volumes:
+      - source_postgres_data:/var/lib/postgresql/data
+      - ./source/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d core_banking"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - banking-net
+
+  analytics-postgres:
+    image: postgres:17-alpine
+    container_name: banking-analytics-postgres
+    environment:
+      POSTGRES_DB: banking_analytics
+      POSTGRES_USER: analytics_app
+      POSTGRES_PASSWORD: analytics_dev
+    ports:
+      - "100.120.10.52:5436:5432"
+    volumes:
+      - analytics_postgres_data:/var/lib/postgresql/data
+      - ./analytics/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analytics_app -d banking_analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - banking-net
+
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: banking-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - banking-net
+
+  connect:
+    image: quay.io/debezium/connect:3.6
+    container_name: banking-debezium-connect
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: banking-connect-cluster
+      CONFIG_STORAGE_TOPIC: banking_connect_configs
+      OFFSET_STORAGE_TOPIC: banking_connect_offsets
+      STATUS_STORAGE_TOPIC: banking_connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "100.120.10.52:8083:8083"
+    restart: unless-stopped
+    networks:
+      - banking-net
+
+  consumer:
+    build:
+      context: ./consumer
+    container_name: banking-risk-consumer
+    depends_on:
+      analytics-postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_GROUP_ID: banking-risk-consumer-v1
+      ANALYTICS_DSN: postgresql://analytics_app:analytics_dev@analytics-postgres:5432/banking_analytics
+      HIGH_VALUE_THRESHOLD: "50000000"
+      NEW_BENEFICIARY_THRESHOLD: "20000000"
+      NEW_BENEFICIARY_WINDOW_MINUTES: "10"
+    restart: unless-stopped
+    networks:
+      - banking-net
+
+  grafana:
+    image: grafana/grafana:13.1.3
+    container_name: banking-grafana
+    depends_on:
+      analytics-postgres:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "100.120.10.52:3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+    networks:
+      - banking-net
+
+  generator:
+    build:
+      context: ./generator
+    profiles: ["demo"]
+    environment:
+      SOURCE_DSN: postgresql://postgres:postgres@source-postgres:5432/core_banking
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+    networks:
+      - banking-net
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    container_name: banking-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_started
+      connect:
+        condition: service_started
+    environment:
+      KAFKA_CLUSTERS_0_NAME: banking-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+      DYNAMIC_CONFIG_ENABLED: "false"
+    ports:
+      - "100.120.10.52:8080:8080"
+
+volumes:
+  source_postgres_data:
+  analytics_postgres_data:
+  kafka_data:
+  grafana_data:
+
+networks:
+  banking-net:
+    driver: bridge
