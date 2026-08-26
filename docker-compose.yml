@@ -118,7 +118,7 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_GROUP_ID: banking-risk-consumer-v1
-      ANALYTICS_DSN: postgresql://analytics_app:analytics_dev@100.120.10.52:5436/banking_analytics
+      ANALYTICS_DSN: postgresql://analytics_app:analytics_dev@analytics-postgres:5432/banking_analytics
       HIGH_VALUE_THRESHOLD: "50000000"
       NEW_BENEFICIARY_THRESHOLD: "20000000"
       NEW_BENEFICIARY_WINDOW_MINUTES: "10"
