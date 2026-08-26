@@ -26,6 +26,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
     networks:
       - banking-net
 
@@ -46,6 +47,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
     networks:
       - banking-net
 
@@ -73,6 +75,7 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     volumes:
       - kafka_data:/var/lib/kafka/data
+    restart: unless-stopped
     networks:
       - banking-net
 
@@ -98,7 +101,7 @@ services:
       KEY_CONVERTER_SCHEMAS_ENABLE: "false"
       VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
     ports:
-      - "100.120.10.52:8083:8083"
+      - "127.0.0.1:8083:8083"
     restart: unless-stopped
     networks:
       - banking-net
@@ -172,6 +175,9 @@ services:
       DYNAMIC_CONFIG_ENABLED: "false"
     ports:
       - "100.120.10.52:8080:8080"
+    restart: unless-stopped
+    networks:
+      - banking-net
 
 volumes:
   source_postgres_data:
