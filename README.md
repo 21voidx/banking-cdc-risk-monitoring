@@ -494,8 +494,9 @@ banking_debezium_slot | pgoutput | logical | t
 Ini adalah bukti bahwa Debezium membaca PostgreSQL melalui logical replication/WAL, bukan polling SQL timestamp.
 
 ---
+## 20. Lihat Kafka CDC topics hasil initial snapshot
 
-## 20. Lihat Kafka CDC topics
+Setelah connector Debezium berstatus `RUNNING`, cek topic Kafka:
 
 ```bash
 docker compose exec kafka \
@@ -504,24 +505,58 @@ docker compose exec kafka \
   --list
 ```
 
-Expected source topics:
+Pada kondisi awal, **belum tentu semua source topic langsung ada**.
+
+Source database project ini memiliki kondisi awal:
+
+```text
+customers      → sudah memiliki seed data
+accounts       → sudah memiliki seed data
+beneficiaries  → masih kosong
+transactions   → masih kosong
+```
+
+Karena connector menggunakan:
+
+```text
+snapshot.mode = initial
+```
+
+Debezium menghasilkan snapshot event (`op = r`) untuk row yang sudah ada.
+
+Karena itu, pada tahap ini minimal Anda kemungkinan melihat:
 
 ```text
 banking.public.accounts
-banking.public.beneficiaries
 banking.public.customers
+```
+
+Selain Kafka internal topics seperti:
+
+```text
+__consumer_offsets
+__debezium-heartbeat.banking
+banking_connect_configs
+banking_connect_offsets
+banking_connect_statuses
+```
+
+Topic berikut **mungkin belum ada**:
+
+```text
+banking.public.beneficiaries
 banking.public.transactions
 ```
 
-Anda juga akan melihat Kafka Connect internal topics.
+Ini bukan error.
+
+Kafka topic tersebut baru digunakan ketika Debezium mempunyai record untuk dipublish dari tabel terkait.
 
 ---
 
-## 21. Inspect raw Debezium event
+## 21. Inspect initial snapshot event
 
-Karena connector menjalankan initial snapshot, topic account/customer sudah memiliki snapshot event (`op = r`).
-
-Contoh:
+Cek satu snapshot event dari account:
 
 ```bash
 docker compose exec kafka \
@@ -532,7 +567,7 @@ docker compose exec kafka \
   --max-messages 1
 ```
 
-Cari struktur:
+Cari struktur seperti:
 
 ```json
 {
@@ -550,20 +585,294 @@ Cari struktur:
 }
 ```
 
-Arti operasi Debezium yang relevan:
+Arti operasi Debezium:
 
 ```text
 r = snapshot read
 c = create / INSERT
 u = update
- d = delete
+d = delete
+```
+
+Perhatikan bahwa:
+
+```text
+op = r
+```
+
+berasal dari **initial snapshot**, bukan transaksi baru setelah connector berjalan.
+
+---
+
+# PHASE C — MATERIALIZE & VERIFY CDC TOPICS
+
+Sebelum Python consumer dijalankan, kita akan membuat perubahan pertama pada tabel yang masih kosong.
+
+Tujuannya:
+
+```text
+beneficiaries kosong
+      ↓
+buat INSERT
+      ↓
+Debezium menghasilkan event
+      ↓
+banking.public.beneficiaries tersedia
+
+
+transactions kosong
+      ↓
+buat INSERT / UPDATE
+      ↓
+Debezium menghasilkan event
+      ↓
+banking.public.transactions tersedia
+```
+
+Ini juga membantu memahami bahwa consumer tidak harus hidup pada saat event dibuat.
+
+Kafka akan menyimpan event sampai consumer membacanya.
+
+---
+
+## 22. Generate bootstrap CDC events
+
+Jalankan suspicious scenario satu kali:
+
+```bash
+docker compose --profile demo run --rm generator suspicious
+```
+
+Scenario ini dipilih karena menyentuh kedua tabel yang sebelumnya kosong:
+
+```text
+1. INSERT beneficiary baru
+2. tunggu sekitar 2 detik
+3. INSERT transaction status=PENDING
+4. UPDATE transaction PENDING → SUCCESS
+5. update balance account terkait
+```
+
+Alur yang terjadi:
+
+```text
+Generator
+   ↓
+PostgreSQL
+   ↓
+WAL
+   ↓
+Debezium
+   ↓
+Kafka Connect
+   ↓
+Kafka
+```
+
+Perhatikan:
+
+```text
+Python risk consumer BELUM dijalankan.
+```
+
+Ini disengaja.
+
+Kafka tetap menyimpan CDC event meskipun downstream consumer belum aktif.
+
+---
+
+## 23. Verifikasi semua CDC topics sekarang tersedia
+
+Cek ulang:
+
+```bash
+docker compose exec kafka \
+  /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --list
+```
+
+Sekarang expected source topics:
+
+```text
+banking.public.accounts
+banking.public.beneficiaries
+banking.public.customers
+banking.public.transactions
+```
+
+Mental model:
+
+```text
+customers
+existing rows
+   ↓ snapshot
+topic created
+
+
+accounts
+existing rows
+   ↓ snapshot
+topic created
+
+
+beneficiaries
+first INSERT
+   ↓ WAL
+   ↓ Debezium
+topic created
+
+
+transactions
+first INSERT / UPDATE
+   ↓ WAL
+   ↓ Debezium
+topic created
+```
+
+Jika keempat topic sudah ada, baru lanjut ke consumer.
+
+---
+
+## 24. Inspect beneficiary CDC event
+
+Cek event beneficiary:
+
+```bash
+docker compose exec kafka \
+  /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic banking.public.beneficiaries \
+  --from-beginning \
+  --max-messages 1
+```
+
+Expected operation:
+
+```text
+op = c
+```
+
+Kenapa bukan `r`?
+
+Karena beneficiary dibuat **setelah initial snapshot selesai**.
+
+Jadi:
+
+```text
+existing row saat snapshot
+→ op = r
+
+INSERT setelah snapshot
+→ op = c
 ```
 
 ---
 
-# PHASE C — CDC CONSUMER
+## 25. Inspect transaction lifecycle
 
-## 22. Start Python consumer
+Cek transaction events:
+
+```bash
+docker compose exec kafka \
+  /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic banking.public.transactions \
+  --from-beginning \
+  --max-messages 2
+```
+
+Anda seharusnya menemukan lifecycle seperti:
+
+```text
+EVENT 1
+
+op = c
+before = null
+after.status = PENDING
+```
+
+kemudian:
+
+```text
+EVENT 2
+
+op = u
+before.status = PENDING
+after.status = SUCCESS
+```
+
+Ini merupakan bukti utama bahwa project menangkap **database change lifecycle**, bukan hanya mengirim transaction baru ke Kafka melalui producer aplikasi.
+
+---
+
+## 26. Optional — Inspect dengan Kafka UI
+
+Start Kafka UI:
+
+```bash
+docker compose up -d kafka-ui
+```
+
+Buka:
+
+```text
+http://100.120.10.52:8080
+```
+
+Masuk ke:
+
+```text
+banking-local
+→ Topics
+```
+
+Pastikan ada:
+
+```text
+banking.public.accounts
+banking.public.beneficiaries
+banking.public.customers
+banking.public.transactions
+```
+
+Untuk melihat transaction CDC:
+
+```text
+Topics
+→ banking.public.transactions
+→ Messages
+```
+
+Perhatikan:
+
+```text
+topic
+partition
+offset
+timestamp
+key
+payload
+before
+after
+op
+```
+
+Kafka UI hanya digunakan untuk observability/debugging.
+
+Ia bukan bagian dari business data flow.
+
+---
+
+# PHASE D — CDC CONSUMER
+
+Sekarang upstream CDC stream sudah lengkap.
+
+Baru jalankan downstream consumer.
+
+---
+
+## 27. Start Python consumer
 
 ```bash
 docker compose up -d consumer
@@ -584,59 +893,149 @@ banking.public.beneficiaries
 banking.public.transactions
 ```
 
-Saat initial snapshot selesai diproses, tekan `Ctrl+C` untuk keluar dari log.
+Alurnya:
+
+```text
+Kafka topics
+     ↓
+Python consumer subscribe
+     ↓
+poll records
+     ↓
+process event
+     ↓
+write analytics PostgreSQL
+     ↓
+commit Kafka offset
+```
+
+Karena bootstrap event sudah berada di Kafka sebelum consumer hidup, consumer akan memproses backlog sesuai konfigurasi offset consumer group.
+
+Untuk project ini, consumer pertama kali harus dapat membaca existing records, bukan hanya message baru.
+
+Jika consumer menggunakan Kafka configuration langsung, pastikan konfigurasi initial offset menggunakan:
+
+```text
+auto.offset.reset = earliest
+```
+
+ketika consumer group belum mempunyai committed offset.
 
 ---
 
-## 23. Verifikasi current state hasil snapshot
+## 28. Verifikasi consumer tidak error
+
+Lihat:
 
 ```bash
-docker compose exec analytics-postgres \
-  psql -U analytics_app -d banking_analytics \
-  -c "SELECT COUNT(*) AS customers FROM customers_current; SELECT COUNT(*) AS accounts FROM accounts_current;"
+docker compose logs --tail=100 consumer
+```
+
+Jangan ada lagi error:
+
+```text
+UNKNOWN_TOPIC_OR_PART
+```
+
+atau:
+
+```text
+Analytics PostgreSQL not ready
+```
+
+Jika consumer berjalan normal:
+
+```bash
+docker compose ps consumer
 ```
 
 Expected:
 
 ```text
-customers = 6
-accounts  = 6
+banking-risk-consumer   Up
 ```
-
-Source snapshot dari Debezium telah direkonstruksi menjadi downstream current state.
 
 ---
 
-## 24. Lihat event history
+## 29. Verifikasi reconstructed current state
+
+Cek downstream:
 
 ```bash
 docker compose exec analytics-postgres \
   psql -U analytics_app -d banking_analytics \
-  -c "SELECT table_name, operation, COUNT(*) FROM cdc_events GROUP BY 1,2 ORDER BY 1,2;"
+  -c "
+SELECT COUNT(*) AS customers FROM customers_current;
+SELECT COUNT(*) AS accounts FROM accounts_current;
+SELECT COUNT(*) AS beneficiaries FROM beneficiaries_current;
+SELECT COUNT(*) AS transactions FROM transactions_current;
+"
 ```
 
-Di awal biasanya dominan:
+Expected secara konseptual:
 
 ```text
-operation = r
+customers      > 0
+accounts       > 0
+beneficiaries  > 0
+transactions   > 0
 ```
 
-karena initial snapshot.
+`customers_current` dan `accounts_current` terutama berasal dari initial snapshot.
+
+Sedangkan beneficiary dan transaction pertama berasal dari bootstrap CDC events yang dibuat sebelumnya.
 
 ---
 
-# PHASE D — GRAFANA
+## 30. Verifikasi CDC event history
 
-## 25. Start Grafana
+```bash
+docker compose exec analytics-postgres \
+  psql -U analytics_app -d banking_analytics \
+  -c "
+SELECT
+    table_name,
+    operation,
+    COUNT(*)
+FROM cdc_events
+GROUP BY 1,2
+ORDER BY 1,2;
+"
+```
+
+Sekarang Anda seharusnya melihat kombinasi operation seperti:
+
+```text
+accounts       | r
+accounts       | u
+beneficiaries  | c
+customers      | r
+transactions   | c
+transactions   | u
+```
+
+Tidak harus persis sama jumlahnya, tetapi sekarang Anda dapat membedakan:
+
+```text
+r → snapshot
+c → INSERT baru
+u → UPDATE
+```
+
+---
+
+# PHASE E — GRAFANA
+
+## 31. Start Grafana
 
 ```bash
 docker compose up -d grafana
 ```
 
-Buka:
+Buka dari device yang terhubung ke Tailscale:
 
 ```text
-http://localhost:3000
+http://100.120.10.52:3000
 ```
 
 Login:
@@ -646,35 +1045,64 @@ username: admin
 password: admin
 ```
 
-Dashboard sudah di-provision otomatis:
+Dashboard:
 
 ```text
-Banking CDC → Banking CDC — Near Real-Time Risk Monitoring
+Banking CDC
+→ Banking CDC — Near Real-Time Risk Monitoring
 ```
 
-Data source juga otomatis menggunakan read-only user:
+Grafana membaca:
 
 ```text
-grafana_reader
+analytics-postgres:5432
 ```
 
-Grafana tidak memakai user writer `analytics_app`.
+melalui Docker network.
 
-Dashboard default refresh:
+Grafana tidak membaca source OLTP langsung.
+
+Flow:
+
+```text
+PostgreSQL OLTP
+      ↓ CDC
+Kafka
+      ↓
+Consumer
+      ↓
+PostgreSQL Analytics
+      ↓
+Grafana
+```
+
+Dashboard refresh setiap sekitar:
 
 ```text
 5 seconds
 ```
 
-Karena Grafana tetap melakukan periodic query terhadap PostgreSQL analytics, project ini disebut **near real-time**, bukan streaming UI real-time.
+Karena Grafana masih melakukan periodic query terhadap analytics PostgreSQL, istilah yang digunakan adalah:
+
+```text
+near real-time dashboard
+```
+
+bukan streaming UI real-time.
 
 ---
 
-# PHASE E — DEMO
+# PHASE F — DEMO
 
-## 26. Demo 1 — Normal transaction
+Infrastructure, CDC stream, consumer, dan dashboard sekarang sudah siap.
 
-Jalankan satu transfer normal:
+Demo berikut digunakan untuk menghasilkan perubahan baru setelah seluruh pipeline aktif.
+
+---
+
+## 32. Demo 1 — Normal transaction
+
+Jalankan:
 
 ```bash
 docker compose --profile demo run --rm generator normal
@@ -683,15 +1111,17 @@ docker compose --profile demo run --rm generator normal
 Yang terjadi:
 
 ```text
-1. generator INSERT transaction status=PENDING
-2. PostgreSQL commit menulis WAL
-3. Debezium menangkap INSERT → op=c
-4. Kafka menerima change event
-5. consumer UPSERT transactions_current
-6. sekitar 0.8 detik kemudian source UPDATE PENDING→SUCCESS
-7. Debezium menangkap UPDATE → op=u
-8. account balances juga berubah melalui CDC
-9. Grafana refresh dan metric transaction berubah
+1. INSERT transaction status=PENDING
+2. PostgreSQL menulis committed change ke WAL
+3. Debezium menangkap INSERT
+4. Kafka menerima op=c
+5. Consumer membaca transaction event
+6. consumer update transactions_current
+7. source transaction berubah PENDING → SUCCESS
+8. Debezium menangkap UPDATE
+9. Kafka menerima op=u
+10. consumer update current state
+11. Grafana menampilkan state terbaru
 ```
 
 Normal transaction seharusnya tidak menghasilkan risk alert.
@@ -701,7 +1131,17 @@ Cek source:
 ```bash
 docker compose exec source-postgres \
   psql -U postgres -d core_banking \
-  -c "SELECT transaction_id, amount, channel, status, created_at FROM transactions ORDER BY created_at DESC LIMIT 5;"
+  -c "
+SELECT
+    transaction_id,
+    amount,
+    channel,
+    status,
+    created_at
+FROM transactions
+ORDER BY created_at DESC
+LIMIT 5;
+"
 ```
 
 Cek downstream:
@@ -709,45 +1149,22 @@ Cek downstream:
 ```bash
 docker compose exec analytics-postgres \
   psql -U analytics_app -d banking_analytics \
-  -c "SELECT transaction_id, amount, channel, status, created_at FROM transactions_current ORDER BY created_at DESC LIMIT 5;"
+  -c "
+SELECT
+    transaction_id,
+    amount,
+    channel,
+    status,
+    created_at
+FROM transactions_current
+ORDER BY created_at DESC
+LIMIT 5;
+"
 ```
 
 ---
 
-## 27. Inspect INSERT dan UPDATE event transaksi
-
-Setelah demo normal:
-
-```bash
-docker compose exec kafka \
-  /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic banking.public.transactions \
-  --from-beginning \
-  --max-messages 2
-```
-
-Anda seharusnya melihat satu event seperti:
-
-```text
-op = c
-before = null
-after.status = PENDING
-```
-
-kemudian:
-
-```text
-op = u
-before.status = PENDING
-after.status = SUCCESS
-```
-
-Inilah screenshot/raw evidence CDC yang bagus untuk LinkedIn.
-
----
-
-## 28. Demo 2 — Suspicious transaction
+## 33. Demo 2 — Suspicious transaction
 
 Jalankan:
 
@@ -759,19 +1176,19 @@ Scenario:
 
 ```text
 1. customer menambahkan beneficiary baru
-2. tunggu 2 detik
-3. customer melakukan transfer Rp75.000.000
+2. tunggu sekitar 2 detik
+3. customer transfer Rp75.000.000
 4. transaction berubah PENDING → SUCCESS
 ```
 
-Expected alerts:
+Expected risk rules:
 
 ```text
 HIGH_VALUE_TRANSFER
 NEW_BENEFICIARY_LARGE_TRANSFER
 ```
 
-Lihat consumer log:
+Cek consumer:
 
 ```bash
 docker compose logs --tail=100 consumer
@@ -783,28 +1200,33 @@ Cari:
 RISK ALERT
 ```
 
-Query alert:
+Cek database:
 
 ```bash
 docker compose exec analytics-postgres \
   psql -U analytics_app -d banking_analytics \
-  -c "SELECT alert_created_at, transaction_id, amount, rule_code, severity FROM risk_alerts ORDER BY alert_created_at DESC;"
+  -c "
+SELECT
+    alert_created_at,
+    transaction_id,
+    amount,
+    rule_code,
+    severity
+FROM risk_alerts
+ORDER BY alert_created_at DESC;
+"
 ```
 
-Grafana akan refresh otomatis dalam sekitar 5 detik.
-
-Anda seharusnya melihat:
+Grafana seharusnya menampilkan perubahan seperti:
 
 ```text
 Risk Alerts      +2
 Flagged Amount   +Rp75M
 ```
 
-Flagged amount menghitung unique transaction, jadi satu transaction dengan dua rules tidak dihitung dua kali.
-
 ---
 
-## 29. Demo 3 — Frozen account activity
+## 34. Demo 3 — Frozen account activity
 
 ```bash
 docker compose --profile demo run --rm generator frozen
@@ -813,11 +1235,15 @@ docker compose --profile demo run --rm generator frozen
 Scenario:
 
 ```text
-account ACTIVE → FROZEN
-wait 2 sec
-new transaction attempted
+account ACTIVE
+      ↓
+FROZEN
+      ↓
+transaction attempted
+      ↓
 transaction FAILED
-account FROZEN → ACTIVE
+      ↓
+account ACTIVE kembali
 ```
 
 Expected alert:
@@ -826,13 +1252,25 @@ Expected alert:
 FROZEN_ACCOUNT_ACTIVITY
 ```
 
-Ini menunjukkan bahwa CDC bukan hanya untuk `INSERT transactions`, tetapi juga dapat membawa perubahan state pada tabel lain yang dipakai downstream.
+Scenario ini menunjukkan bahwa CDC tidak hanya menangkap:
+
+```text
+INSERT transactions
+```
+
+tetapi juga perubahan state:
+
+```text
+UPDATE accounts
+```
+
+yang kemudian digunakan oleh downstream risk logic.
 
 ---
 
-## 30. Continuous dummy transaction stream
+## 35. Continuous dummy stream
 
-Jalankan normal transaction setiap 2 detik:
+Untuk melihat dashboard bergerak:
 
 ```bash
 docker compose --profile demo run --rm generator stream --interval 2
@@ -844,351 +1282,119 @@ Stop:
 Ctrl+C
 ```
 
-Untuk memasukkan suspicious scenario setiap 10 transaction:
+Untuk menyisipkan suspicious scenario setiap 10 transaksi:
 
 ```bash
-docker compose --profile demo run --rm generator stream --interval 2 --risk-every 10
+docker compose --profile demo run --rm generator stream \
+  --interval 2 \
+  --risk-every 10
 ```
 
-Gunakan ini jika ingin screen-record Grafana bergerak secara near real-time.
+Gunakan mode ini untuk screen recording Grafana.
 
 ---
 
-# 31. Bagaimana current state dan event history berbeda?
+# Urutan setup final
 
-Consumer menulis dua representation yang berbeda.
-
-## A. Immutable-ish CDC history
+Mental model setup manual project sekarang adalah:
 
 ```text
-cdc_events
+PHASE A
+Source PostgreSQL
+Analytics PostgreSQL
+Kafka
+        ↓
+verify source + WAL + broker
+
+
+PHASE B
+Kafka Connect
+Debezium connector
+        ↓
+verify RUNNING
+verify replication slot
+        ↓
+initial snapshot
+
+
+PHASE C
+Generate first source changes
+        ↓
+materialize empty-table topics
+        ↓
+verify 4 CDC topics
+        ↓
+inspect raw events
+
+
+PHASE D
+Start consumer
+        ↓
+subscribe
+        ↓
+poll backlog
+        ↓
+reconstruct downstream state
+
+
+PHASE E
+Start Grafana
+        ↓
+verify dashboard
+
+
+PHASE F
+Run normal / suspicious / frozen demos
 ```
 
-Contoh lifecycle satu transaction:
+Atau secara end-to-end:
 
 ```text
-TX1 | c | before=NULL    | after=PENDING
-TX1 | u | before=PENDING | after=SUCCESS
+SETUP SOURCE
+     ↓
+CHECK WAL
+     ↓
+START KAFKA
+     ↓
+START KAFKA CONNECT
+     ↓
+REGISTER DEBEZIUM
+     ↓
+CHECK CONNECTOR
+     ↓
+GENERATE FIRST CHANGE
+     ↓
+CHECK TOPICS
+     ↓
+CHECK RAW EVENT
+     ↓
+START CONSUMER
+     ↓
+CHECK DOWNSTREAM
+     ↓
+START DASHBOARD
+     ↓
+RUN DEMOS
 ```
 
-Event identity:
+---
+
+# Tambahan Troubleshooting — Topic belum tersedia
+
+Jika consumer mendapatkan:
 
 ```text
-topic:partition:offset
+UNKNOWN_TOPIC_OR_PART
 ```
 
-Contoh:
+misalnya:
 
 ```text
-banking.public.transactions:0:25
+Subscribed topic not available:
+banking.public.beneficiaries
 ```
 
-`event_id` adalah primary key sehingga Kafka replay tidak membuat event row duplicate.
-
-## B. Current state
-
-```text
-transactions_current
-```
-
-Hanya state paling baru:
-
-```text
-TX1 | SUCCESS
-```
-
-Ini memudahkan Grafana membaca state terbaru tanpa harus melakukan dedup CDC log pada setiap query.
-
----
-
-# 32. Delivery semantics / idempotency
-
-Consumer menggunakan pola sederhana:
-
-```text
-read Kafka message
-      ↓
-BEGIN PostgreSQL transaction
-      ↓
-INSERT cdc_events with unique topic-partition-offset
-      ↓
-UPSERT current state
-      ↓
-INSERT risk alerts with unique transaction_id + rule_code
-      ↓
-COMMIT PostgreSQL
-      ↓
-commit Kafka offset
-```
-
-Jika proses crash **setelah DB commit tetapi sebelum Kafka offset commit**, message dapat dibaca ulang.
-
-Tetapi:
-
-```text
-cdc_events.event_id UNIQUE
-risk_alerts(transaction_id, rule_code) UNIQUE
-UPSERT current tables
-```
-
-membuat replay aman untuk scope project ini.
-
-Ini bukan klaim generic exactly-once end-to-end. Ini adalah **at-least-once consumption dengan idempotent database writes**.
-
----
-
-# 33. Test replay/catch-up behavior
-
-Ini demo engineering yang bagus.
-
-Stop consumer:
-
-```bash
-docker compose stop consumer
-```
-
-Buat beberapa transaction ketika consumer mati:
-
-```bash
-docker compose --profile demo run --rm generator normal
-docker compose --profile demo run --rm generator normal
-docker compose --profile demo run --rm generator normal
-```
-
-Start consumer lagi:
-
-```bash
-docker compose start consumer
-```
-
-Lihat log:
-
-```bash
-docker compose logs -f consumer
-```
-
-Consumer akan catch up dari Kafka offsets.
-
----
-
-# 34. Test Debezium/WAL catch-up
-
-Stop Kafka Connect/Debezium:
-
-```bash
-docker compose stop connect
-```
-
-Buat source transaction:
-
-```bash
-docker compose --profile demo run --rm generator normal
-```
-
-Start connector lagi:
-
-```bash
-docker compose start connect
-```
-
-Debezium menggunakan replication slot/WAL position untuk melanjutkan dari perubahan yang belum dikirim.
-
-> Production note: replication slot yang tidak dikonsumsi dalam waktu lama dapat menyebabkan WAL tertahan dan disk usage meningkat. Monitoring replication slot lag wajib pada production.
-
----
-
-# 35. Unit test risk rules
-
-Risk rules dipisahkan dari Kafka/DB code sehingga logic sederhana dapat diuji tanpa infrastructure.
-
-Dari root project:
-
-```bash
-python consumer/test_rules.py
-```
-
-Expected:
-
-```text
-Ran 3 tests
-OK
-```
-
-Tidak ada external Python dependency yang diperlukan untuk test ini karena `rules.py` hanya menggunakan Python standard library.
-
----
-
-# 36. Useful SQL checks
-
-## Source transactions
-
-```bash
-docker compose exec source-postgres \
-  psql -U postgres -d core_banking \
-  -c "SELECT * FROM transactions ORDER BY created_at DESC LIMIT 10;"
-```
-
-## Current downstream transactions
-
-```bash
-docker compose exec analytics-postgres \
-  psql -U analytics_app -d banking_analytics \
-  -c "SELECT * FROM transactions_current ORDER BY created_at DESC LIMIT 10;"
-```
-
-## CDC operations
-
-```bash
-docker compose exec analytics-postgres \
-  psql -U analytics_app -d banking_analytics \
-  -c "SELECT table_name, operation, COUNT(*) FROM cdc_events GROUP BY 1,2 ORDER BY 1,2;"
-```
-
-## Recent alerts
-
-```bash
-docker compose exec analytics-postgres \
-  psql -U analytics_app -d banking_analytics \
-  -c "SELECT * FROM risk_alerts ORDER BY alert_created_at DESC LIMIT 20;"
-```
-
-## Duplicate check
-
-```bash
-docker compose exec analytics-postgres \
-  psql -U analytics_app -d banking_analytics \
-  -c "SELECT topic, partition_id, kafka_offset, COUNT(*) FROM cdc_events GROUP BY 1,2,3 HAVING COUNT(*) > 1;"
-```
-
-Expected:
-
-```text
-0 rows
-```
-
----
-
-# 37. Service logs
-
-All:
-
-```bash
-docker compose logs --tail=100
-```
-
-Debezium:
-
-```bash
-docker compose logs --tail=200 connect
-```
-
-Consumer:
-
-```bash
-docker compose logs --tail=200 consumer
-```
-
-Kafka:
-
-```bash
-docker compose logs --tail=200 kafka
-```
-
-Grafana:
-
-```bash
-docker compose logs --tail=200 grafana
-```
-
----
-
-# 38. Stop project
-
-Stop container tetapi pertahankan volumes/data:
-
-```bash
-docker compose down
-```
-
-Start lagi:
-
-```bash
-docker compose up -d source-postgres analytics-postgres kafka connect consumer grafana
-```
-
----
-
-# 39. Full reset
-
-Untuk menghapus SEMUA local data termasuk:
-
-- PostgreSQL source data;
-- analytics data;
-- Kafka topics/offsets;
-- Debezium connector offsets;
-- Grafana local state.
-
-Jalankan:
-
-```bash
-docker compose down -v
-```
-
-Kemudian ulangi dari Phase A.
-
-> Hati-hati: `-v` menghapus named volumes project ini.
-
----
-
-# 40. Troubleshooting
-
-## Connector registration mengatakan already exists
-
-Cek:
-
-```bash
-curl http://localhost:8083/connectors
-```
-
-Jika `banking-postgres-cdc` sudah ada, tidak perlu register lagi.
-
-Untuk delete connector config:
-
-```bash
-curl -X DELETE http://localhost:8083/connectors/banking-postgres-cdc
-```
-
-Kemudian register ulang.
-
----
-
-## Connector FAILED
-
-```bash
-curl http://localhost:8083/connectors/banking-postgres-cdc/status
-
-docker compose logs --tail=300 connect
-```
-
-Cek juga source:
-
-```bash
-docker compose exec source-postgres \
-  psql -U postgres -d core_banking \
-  -c "SHOW wal_level; SELECT * FROM pg_replication_slots;"
-```
-
----
-
-## Consumer tidak menerima data
-
-Pastikan connector RUNNING:
-
-```bash
-curl http://localhost:8083/connectors/banking-postgres-cdc/status
-```
-
-Pastikan topic ada:
+cek topic:
 
 ```bash
 docker compose exec kafka \
@@ -1197,309 +1403,63 @@ docker compose exec kafka \
   --list
 ```
 
-Lihat consumer:
+Jika topic untuk tabel kosong belum tersedia, jangan langsung menyimpulkan Debezium gagal.
+
+Cek:
 
 ```bash
-docker compose logs --tail=300 consumer
+docker compose exec source-postgres \
+  psql -U postgres -d core_banking \
+  -c "
+SELECT COUNT(*) FROM beneficiaries;
+SELECT COUNT(*) FROM transactions;
+"
 ```
 
----
-
-## Grafana kosong
-
-Pertama cek analytics DB langsung:
-
-```bash
-docker compose exec analytics-postgres \
-  psql -U analytics_app -d banking_analytics \
-  -c "SELECT COUNT(*) FROM transactions_current; SELECT COUNT(*) FROM risk_alerts;"
-```
-
-Jika DB berisi data tetapi dashboard kosong, cek datasource Grafana:
+Jika masih:
 
 ```text
-Connections → Data sources → Banking Analytics PostgreSQL
+0 rows
 ```
 
----
-
-## Port already in use
-
-Project memakai:
-
-```text
-3000  Grafana
-5432  Source PostgreSQL
-5433  Analytics PostgreSQL
-8083  Kafka Connect REST
-```
-
-Jika salah satu port dipakai service lain, ubah mapping kiri di `docker-compose.yml`.
-
-Contoh:
-
-```yaml
-ports:
-  - "15432:5432"
-```
-
-Container-to-container port tetap `5432`.
-
----
-
-# 41. Important engineering judgement
-
-## A. Kenapa CDC tepat di sini?
-
-Source application hanya menulis ke PostgreSQL dan downstream membutuhkan perubahan row dengan latency rendah tanpa polling source terus-menerus.
-
-CDC membaca change log/WAL sehingga downstream mendapatkan committed database changes secara incremental.
-
-## B. Kapan CDC bukan pilihan pertama?
-
-Jika aplikasi modern sudah menghasilkan domain event seperti:
-
-```text
-TransferCreated
-TransferSettled
-AccountFrozen
-```
-
-maka untuk service integration saya lebih mempertimbangkan:
-
-```text
-Application
-   ↓
-Transactional Outbox
-   ↓
-Kafka
-```
-
-CDC database tidak otomatis sama dengan domain-event architecture.
-
-## C. Kenapa Kafka ada?
-
-Kafka memberi:
-
-- durable event log;
-- decoupling Debezium dan consumer;
-- replay/catch-up;
-- consumer dapat restart tanpa meminta source DB mengulang query.
-
-Tetapi project ini hanya menggunakan **single broker** karena local portfolio tidak membutuhkan high availability.
-
-## D. Kenapa bukan Debezium Server langsung ke sink?
-
-Untuk use case satu sink sederhana, Debezium Server dapat mengurangi infrastructure.
-
-Project ini sengaja memakai Kafka karena bagian yang ingin ditunjukkan adalah:
-
-```text
-CDC → durable change stream → consumer replay
-```
-
-Bukan karena setiap CDC architecture wajib Kafka.
-
-## E. Kenapa Python bukan Spark/Flink?
-
-Throughput dummy sangat kecil dan rule hanya lookup + comparison sederhana.
-
-Distributed stream processor belum justified.
-
-Spark/Flink mulai masuk akal jika requirement berubah menjadi:
-
-- throughput tinggi;
-- event-time windows;
-- complex stateful joins;
-- late/out-of-order event handling;
-- large aggregation state;
-- horizontal scaling yang nyata.
-
----
-
-# 42. Important limitation: cross-topic ordering
-
-`beneficiaries` dan `transactions` berada pada Kafka topic berbeda.
-
-Kafka menjaga ordering **dalam partition suatu topic**, bukan global ordering antar-topic.
-
-Untuk membuat portfolio demo deterministik, `generator suspicious` melakukan:
-
-```text
-INSERT beneficiary
-wait 2 seconds
-INSERT transaction
-```
-
-sehingga downstream beneficiary state biasanya sudah tersedia ketika transaction dievaluasi.
-
-Ini **bukan solusi production untuk ordering**.
-
-Production options tergantung requirement, misalnya:
-
-- stateful stream processing dengan event-time semantics;
-- repartition/co-locate events berdasarkan key yang sesuai;
-- dedicated domain events;
-- transactional outbox;
-- risk service yang menyimpan state dengan strategy untuk late/out-of-order events.
-
-Menyadari limitation ini lebih penting daripada menyembunyikannya.
-
----
-
-# 43. Other production limitations
-
-Project ini sengaja local/development grade:
-
-- single Kafka broker, tidak HA;
-- local plaintext credentials;
-- tidak ada TLS/SASL;
-- Debezium container community image digunakan untuk learning/evaluation;
-- `REPLICA IDENTITY FULL` dipakai agar before-image mudah didemokan, tetapi meningkatkan WAL volume;
-- consumer memproses per-message, bukan optimized micro-batching;
-- belum ada DLQ;
-- belum ada metrics/alert untuk Kafka lag dan replication slot lag;
-- Grafana refresh 5 detik cocok untuk demo kecil, bukan rekomendasi universal production;
-- deterministic rules bukan fraud/AML model production;
-- dummy data tidak merepresentasikan data customer bank nyata.
-
----
-
-# 44. Folder structure
-
-```text
-banking-cdc-risk-monitoring/
-│
-├── docker-compose.yml
-├── README.md
-├── LICENSE
-├── .gitignore
-│
-├── source/
-│   └── init.sql
-│
-├── debezium/
-│   └── connector.json
-│
-├── consumer/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   ├── rules.py
-│   ├── consumer.py
-│   └── test_rules.py
-│
-├── generator/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── generator.py
-│
-├── analytics/
-│   └── init.sql
-│
-└── grafana/
-    ├── provisioning/
-    │   ├── datasources/
-    │   │   └── postgres.yml
-    │   └── dashboards/
-    │       └── dashboards.yml
-    │
-    └── dashboards/
-        └── banking-cdc-dashboard.json
-```
-
----
-
-# 45. Suggested LinkedIn showcase
-
-Jangan hanya screenshot dashboard.
-
-Gunakan tiga visual:
-
-### Visual 1 — Architecture diagram
-
-```text
-PostgreSQL WAL
-     ↓
-Debezium
-     ↓
-Kafka
-     ↓
-Python Consumer
-     ↓
-PostgreSQL Analytics
-     ↓
-Grafana
-```
-
-### Visual 2 — Raw CDC event
-
-Tunjukkan:
-
-```text
-op = u
-before.status = PENDING
-after.status = SUCCESS
-```
-
-Ini membuktikan bahwa project benar-benar menangkap change event, bukan hanya insert producer biasa.
-
-### Visual 3 — Grafana / screen recording
-
-Record:
+jalankan first CDC scenario:
 
 ```bash
 docker compose --profile demo run --rm generator suspicious
 ```
 
-Lalu dashboard berubah:
+kemudian cek topic lagi.
+
+Target:
 
 ```text
-Risk Alerts    +2
-Flagged Amount +Rp75M
+banking.public.accounts
+banking.public.beneficiaries
+banking.public.customers
+banking.public.transactions
 ```
 
-Kemudian recent alert table menampilkan transaction baru.
+Setelah itu baru start/restart consumer.
 
 ---
 
-# 46. Interview explanation
+# Revisi Definition of Done
 
-Versi singkat:
+Project dianggap selesai jika:
 
-> Saya mensimulasikan legacy banking application yang hanya menulis ke PostgreSQL. Karena downstream operational risk membutuhkan perubahan data lebih cepat tanpa polling OLTP berulang, saya memilih log-based CDC. Debezium membaca committed changes dari PostgreSQL WAL dan menulisnya ke Kafka. Lightweight Python consumer cukup untuk volume dan rule sederhana, lalu saya menyimpan immutable CDC history, reconstructed current state, dan idempotent risk alerts di PostgreSQL analytics. Grafana membaca analytics DB setiap 5 detik sehingga hasilnya near real-time. Saya sengaja tidak memakai Spark, Airflow, Kubernetes, atau cloud warehouse karena requirement MVP tidak membutuhkannya.
-
----
-
-# 47. Definition of Done
-
-Project dianggap selesai jika semua ini berhasil:
-
-- [ ] PostgreSQL menjalankan `wal_level=logical`.
-- [ ] Debezium connector status `RUNNING`.
-- [ ] Kafka memiliki empat source CDC topics.
-- [ ] Initial snapshot membentuk `customers_current` dan `accounts_current`.
-- [ ] Normal transaction menghasilkan `op=c` dan `op=u`.
-- [ ] Suspicious scenario menghasilkan dua risk alerts.
-- [ ] Frozen account scenario menghasilkan satu risk alert.
-- [ ] Kafka replay tidak menghasilkan duplicate `cdc_events` atau duplicate risk rule untuk transaction yang sama.
-- [ ] Grafana dashboard refresh setiap 5 detik.
-- [ ] Anda dapat menjelaskan kenapa setiap tool dipakai dan kenapa tool lain tidak dipakai.
-
----
-
-# 48. Official references
-
-- Debezium PostgreSQL Connector: https://debezium.io/documentation/reference/stable/connectors/postgresql.html
-- Debezium container images: https://debezium.io/documentation/reference/stable/install.html
-- Apache Kafka Docker: https://kafka.apache.org/43/getting-started/docker/
-- PostgreSQL Logical Replication: https://www.postgresql.org/docs/current/logical-replication.html
-- Grafana PostgreSQL datasource: https://grafana.com/docs/grafana/latest/datasources/postgres/configure/
-- Grafana Docker installation: https://grafana.com/docs/grafana/latest/setup-grafana/installation/docker/
-
----
-
-## Local security note
-
-Credentials pada repository ini sengaja sederhana dan hard-coded agar setup portfolio mudah dipahami.
-
-Jangan gunakan konfigurasi credential ini untuk production.
+* [ ] PostgreSQL menjalankan `wal_level=logical`.
+* [ ] Publication berisi empat source table.
+* [ ] Debezium replication slot aktif.
+* [ ] Debezium connector berstatus `RUNNING`.
+* [ ] Initial snapshot menghasilkan event `op=r`.
+* [ ] First source changes menghasilkan topic untuk tabel yang awalnya kosong.
+* [ ] Kafka memiliki empat source CDC topics setelah bootstrap event.
+* [ ] Transaction menghasilkan `op=c` dan `op=u`.
+* [ ] Consumer dapat membaca event yang sudah tersimpan sebelum consumer aktif.
+* [ ] Consumer membentuk current-state tables di analytics PostgreSQL.
+* [ ] Suspicious transaction menghasilkan expected risk alerts.
+* [ ] Frozen account scenario menghasilkan `FROZEN_ACCOUNT_ACTIVITY`.
+* [ ] Kafka replay tidak menggandakan `cdc_events`.
+* [ ] Risk rule yang sama tidak duplicate untuk transaction yang sama.
+* [ ] Grafana menampilkan perubahan dengan refresh sekitar 5 detik.
+* [ ] Anda dapat menjelaskan alur `source → WAL → Debezium → Kafka Connect → Kafka → consumer → downstream`.

@@ -163,9 +163,14 @@ def frozen(conn):
     print(f"restored account={source[0]} to ACTIVE")
 
 
-def stream(conn, interval, risk_every):
+def stream(conn, interval_min, interval_max, risk_every):
     counter = 0
-    print("continuous generator started; press Ctrl+C to stop")
+    print(
+        f"continuous generator started; "
+        f"interval={interval_min}-{interval_max}s; "
+        f"press Ctrl+C to stop"
+    )
+
     while True:
         counter += 1
         try:
@@ -173,7 +178,11 @@ def stream(conn, interval, risk_every):
                 suspicious(conn)
             else:
                 normal(conn)
+
+            interval = random.uniform(interval_min, interval_max)
+            print(f"waiting {interval:.3f}s...")
             time.sleep(interval)
+
         except psycopg.errors.CheckViolation as exc:
             conn.rollback()
             print(f"transaction skipped due to constraint: {exc}")
@@ -188,8 +197,25 @@ def main():
     sub.add_parser("normal", help="Create one ordinary transfer")
     sub.add_parser("suspicious", help="Create a new beneficiary followed by a Rp75M transfer")
     sub.add_parser("frozen", help="Attempt a transfer from a temporarily frozen account")
-    stream_parser = sub.add_parser("stream", help="Continuously create dummy transactions")
-    stream_parser.add_argument("--interval", type=float, default=2.0, help="Seconds between scenarios")
+    stream_parser = sub.add_parser(
+        "stream",
+        help="Continuously create dummy transactions"
+    )
+
+    stream_parser.add_argument(
+        "--interval-min",
+        type=float,
+        default=0.1,
+        help="Minimum seconds between scenarios",
+    )
+
+    stream_parser.add_argument(
+        "--interval-max",
+        type=float,
+        default=2.0,
+        help="Maximum seconds between scenarios",
+    )
+
     stream_parser.add_argument(
         "--risk-every",
         type=int,
@@ -207,7 +233,12 @@ def main():
         elif args.scenario == "frozen":
             frozen(conn)
         elif args.scenario == "stream":
-            stream(conn, args.interval, args.risk_every)
+            stream(
+                conn,
+                args.interval_min,
+                args.interval_max,
+                args.risk_every,
+            )
     finally:
         conn.close()
 
