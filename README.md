@@ -4,6 +4,16 @@ Portfolio Data Engineering sederhana untuk menunjukkan **log-based Change Data C
 
 Project ini mensimulasikan aplikasi core banking yang hanya menulis ke PostgreSQL OLTP. Perubahan row ditangkap dari PostgreSQL WAL oleh Debezium, diteruskan ke Kafka, diproses oleh lightweight Python consumer, lalu disimpan ke PostgreSQL analytics dan divisualisasikan di Grafana dengan refresh 5 detik.
 
+## Architecture
+
+<p align="center">
+  <img src="images/architecture_diagram.png" alt="Banking CDC — Near Real-Time Risk Monitoring" width="100%" />
+</p>
+
+<p align="center">
+  <img src="images/banking-cdc.gif" alt="Banking CDC — Near Real-Time Risk Monitoring gif" width="100%" />
+</p>
+
 > Fokus project: **memahami CDC dan engineering judgement**, bukan membuat sistem fraud detection production-grade.
 
 ---
